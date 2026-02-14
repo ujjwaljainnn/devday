@@ -61,7 +61,7 @@ export ANTHROPIC_API_KEY=sk-...
 
 ## How it works
 
-devday reads completed sessions from each tool's local storage. Active sessions (still running) may not appear until they're closed. Sessions are grouped by project directory, and git commits are matched by date.
+devday reads completed sessions from each tool's local storage. Sessions are grouped by project directory, and git commits are matched by date.
 
 Duration is calculated from actual message processing times (not wall-clock), capped at 5 minutes per message to handle tools that write bogus completion timestamps.
 
