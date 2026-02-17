@@ -9,7 +9,7 @@ import { ClaudeCodeParser } from './parsers/claude-code.js';
 import { CursorParser } from './parsers/cursor.js';
 import { getGitActivity } from './git.js';
 import { buildDayRecap } from './merge.js';
-import { summarizeRecap } from './summarize.js';
+import { summarizeRecap, type SummarizeLogger } from './summarize.js';
 import { renderRecap } from './render.js';
 import type { Session, GitActivity, Parser } from './types.js';
 
@@ -52,7 +52,8 @@ Examples:
   $ devday -d yesterday -s    yesterday's standup
 
 Environment variables:
-  OPENAI_API_KEY              enables AI-powered summaries via OpenAI (recommended)
+  CONCENTRATE_API_KEY         enables AI-powered summaries via Concentrate AI (recommended)
+  OPENAI_API_KEY              enables AI-powered summaries via OpenAI
   ANTHROPIC_API_KEY           enables AI-powered summaries via Anthropic
 
 Supported tools:
@@ -156,11 +157,20 @@ Supported tools:
 
       // ── Summarize (only if API key is available) ──────────
       const hasApiKey = config.preferredSummarizer !== 'none';
+      const summaryWarnings: string[] = [];
 
       if (hasApiKey && opts.summarize !== false) {
         debug(`using ${config.preferredSummarizer} for summarization`);
         spinner.text = 'Generating summary...';
-        recap = await summarizeRecap(recap, config);
+
+        const logger: SummarizeLogger = {
+          debug,
+          warn: (msg: string) => {
+            debug(`[warn] ${msg}`);
+            summaryWarnings.push(msg);
+          },
+        };
+        recap = await summarizeRecap(recap, config, logger);
       } else if (!hasApiKey) {
         debug('no API key set, skipping summarization');
       }
@@ -173,7 +183,7 @@ Supported tools:
         console.log(chalk.yellow('  Standup requires an API key to generate summaries.'));
         console.log('');
         console.log('  Run:');
-        console.log(chalk.cyan('    export OPENAI_API_KEY=sk-...'));
+        console.log(chalk.cyan('    export CONCENTRATE_API_KEY=sk-cn-...'));
         console.log('');
         console.log('  Then try again:');
         console.log(chalk.cyan('    devday --standup'));
@@ -184,11 +194,23 @@ Supported tools:
       // ── Render ──────────────────────────────────────────────
       renderRecap(recap, { standup: opts.standup, json: isJson });
 
+      // Show summary warnings (auth errors, timeouts, etc.)
+      if (summaryWarnings.length > 0 && !isJson) {
+        console.log('');
+        console.log(chalk.yellow('  Summary warnings:'));
+        // Deduplicate identical errors (e.g. same auth error for every project)
+        const unique = [...new Set(summaryWarnings)];
+        for (const w of unique) {
+          console.log(chalk.dim(`    • ${w}`));
+        }
+        console.log('');
+      }
+
       // Prompt to set API key if not configured
       if (!hasApiKey && !isJson) {
         console.log('');
         console.log('  To generate AI-powered summaries and standup messages:');
-        console.log(chalk.cyan('    export OPENAI_API_KEY=sk-...'));
+        console.log(chalk.cyan('    export CONCENTRATE_API_KEY=sk-cn-...'));
         console.log('');
       }
     } catch (error) {

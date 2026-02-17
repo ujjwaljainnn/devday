@@ -34,21 +34,24 @@ function detectAvailableTools(): ToolName[] {
 
 /**
  * Load config purely from environment variables + auto-detection.
- * API keys come from env vars only (OPENAI_API_KEY, ANTHROPIC_API_KEY).
+ * API keys come from env vars only (CONCENTRATE_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).
  * Tool paths are auto-detected. Non-sensitive preferences can be saved to config file.
  */
 export function loadConfig(): DevDayConfig {
   const paths = getDefaultPaths();
 
+  const concentrateKey = process.env.CONCENTRATE_API_KEY ?? null;
   const anthropicKey = process.env.ANTHROPIC_API_KEY ?? null;
   const openaiKey = process.env.OPENAI_API_KEY ?? null;
 
-  // Prefer OpenAI (cheaper for summarization), fall back to Anthropic
-  let preferredSummarizer: 'anthropic' | 'openai' | 'none' = 'none';
-  if (openaiKey) preferredSummarizer = 'openai';
+  // Prefer Concentrate (unified gateway, auto-routing), then OpenAI, then Anthropic
+  let preferredSummarizer: 'concentrate' | 'anthropic' | 'openai' | 'none' = 'none';
+  if (concentrateKey) preferredSummarizer = 'concentrate';
+  else if (openaiKey) preferredSummarizer = 'openai';
   else if (anthropicKey) preferredSummarizer = 'anthropic';
 
   const defaults: DevDayConfig = {
+    concentrateApiKey: concentrateKey,
     anthropicApiKey: anthropicKey,
     openaiApiKey: openaiKey,
     preferredSummarizer,

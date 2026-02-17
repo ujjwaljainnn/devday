@@ -107,9 +107,10 @@ export interface DayRecap {
 // ── Config ───────────────────────────────────────────────────────
 export interface DevDayConfig {
   // API keys for summarization
+  concentrateApiKey: string | null;
   anthropicApiKey: string | null;
   openaiApiKey: string | null;
-  preferredSummarizer: 'anthropic' | 'openai' | 'none';
+  preferredSummarizer: 'concentrate' | 'anthropic' | 'openai' | 'none';
 
   // Tool-specific paths (auto-detected, user-overridable)
   paths: {
