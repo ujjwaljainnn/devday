@@ -52,7 +52,7 @@ Examples:
   $ devday -d yesterday -s    yesterday's standup
 
 Environment variables:
-  CONCENTRATE_API_KEY         enables AI-powered summaries via Concentrate AI (recommended)
+  CONCENTRATE_API_KEY         enables AI-powered summaries via Concentrate AI
   OPENAI_API_KEY              enables AI-powered summaries via OpenAI
   ANTHROPIC_API_KEY           enables AI-powered summaries via Anthropic
 

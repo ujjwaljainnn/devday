@@ -55,13 +55,13 @@ devday -v                     # debug output
 Summaries are optional. Without an API key, devday shows stats and git only.
 
 ```bash
-export CONCENTRATE_API_KEY=sk-cn-...   # recommended
+export CONCENTRATE_API_KEY=sk-cn-...
 # or
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-...
 ```
 
-### Concentrate AI (recommended)
+### Concentrate AI
 
 [Concentrate AI](https://concentrate.ai/?utm_source=fzm&utm_medium=gh&utm_campaign=ujhj) is a unified LLM gateway that routes to 50+ models (GPT-5, Claude, Gemini, etc.) through a single API key. devday uses it with `gpt-5-mini` for fast, cheap summarization.
 

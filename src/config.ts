@@ -44,7 +44,7 @@ export function loadConfig(): DevDayConfig {
   const anthropicKey = process.env.ANTHROPIC_API_KEY ?? null;
   const openaiKey = process.env.OPENAI_API_KEY ?? null;
 
-  // Prefer Concentrate (unified gateway, auto-routing), then OpenAI, then Anthropic
+  // Use whichever API key is available: Concentrate, OpenAI, or Anthropic
   let preferredSummarizer: 'concentrate' | 'anthropic' | 'openai' | 'none' = 'none';
   if (concentrateKey) preferredSummarizer = 'concentrate';
   else if (openaiKey) preferredSummarizer = 'openai';
