@@ -74,3 +74,9 @@ devday reads completed sessions from each tool's local storage. Sessions are gro
 Duration is calculated from actual message processing times (not wall-clock), capped at 5 minutes per message to handle tools that write bogus completion timestamps.
 
 Cost is estimated from token counts and model pricing tables when the tool doesn't provide it directly.
+
+## Contributing
+
+Contributions are welcome. Fork the repo, make your changes, and open a PR.
+
+If you use this tool and think it can be better — parsers for new tools, better summaries, new output formats, whatever — send it through. Let's make this thing more useful.
