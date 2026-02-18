@@ -9,7 +9,7 @@ End-of-day recap for AI-assisted coding sessions. Reads your local conversations
 - Scans completed AI coding sessions from your local machine (nothing leaves your machine unless you enable LLM summaries)
 - Shows tokens used, estimated cost, duration, and models per session
 - Groups sessions by project and shows git commits alongside
-- Optionally generates first-person standup messages via OpenAI or Anthropic
+- Optionally generates first-person standup messages via [Concentrate AI](https://concentrate.ai/?utm_source=fzm&utm_medium=gh&utm_campaign=ujhj), OpenAI, or Anthropic
 
 ## Supported tools
 
@@ -55,9 +55,17 @@ devday -v                     # debug output
 Summaries are optional. Without an API key, devday shows stats and git only.
 
 ```bash
-export OPENAI_API_KEY=sk-...      # or
+export CONCENTRATE_API_KEY=sk-cn-...   # recommended
+# or
+export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-...
 ```
+
+### Concentrate AI (recommended)
+
+[Concentrate AI](https://concentrate.ai/?utm_source=fzm&utm_medium=gh&utm_campaign=ujhj) is a unified LLM gateway that routes to 50+ models (GPT-5, Claude, Gemini, etc.) through a single API key. devday uses it with `gpt-5-mini` for fast, cheap summarization.
+
+**$20 in free credits** when you [sign up](https://concentrate.ai/?utm_source=fzm&utm_medium=gh&utm_campaign=ujhj) — more than enough to run devday for months.
 
 ## How it works
 

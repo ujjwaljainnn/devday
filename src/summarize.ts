@@ -2,54 +2,109 @@ import type { DayRecap, DevDayConfig, ProjectSummary } from './types.js';
 
 const LLM_TIMEOUT_MS = 30_000;
 
+// ── Error types ──────────────────────────────────────────────────
+
+type LlmResult =
+  | { ok: true; text: string }
+  | { ok: false; error: string; retriable: boolean };
+
+/** Optional logger — when provided, debug/warning messages are emitted. */
+export interface SummarizeLogger {
+  debug: (msg: string) => void;
+  warn: (msg: string) => void;
+}
+
+const noopLogger: SummarizeLogger = {
+  debug: () => {},
+  warn: () => {},
+};
+
+// ── Public API ───────────────────────────────────────────────────
+
 /**
  * Generate LLM-powered summaries for the day recap.
- * Requires an API key (OPENAI_API_KEY or ANTHROPIC_API_KEY).
+ * Requires an API key (CONCENTRATE_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY).
  * Returns the recap with summaries filled in, or null fields if LLM calls fail.
  */
 export async function summarizeRecap(
   recap: DayRecap,
   config: DevDayConfig,
+  logger: SummarizeLogger = noopLogger,
 ): Promise<DayRecap> {
+  const provider = config.preferredSummarizer;
+  let hasFailure = false;
+
   // Generate project-level summaries
   for (const project of recap.projects) {
-    project.aiSummary = await summarizeProject(project, config);
+    const result = await summarizeProject(project, config, logger);
+    if (result === null) hasFailure = true;
+    project.aiSummary = result;
   }
 
-  // Generate standup message
-  recap.standupMessage = await generateStandup(recap, config);
+  // Only attempt standup if at least some project summaries succeeded.
+  // If every project failed, the same underlying issue (bad key, rate limit, etc.)
+  // will just fail again on the standup call.
+  if (hasFailure && recap.projects.every((p) => p.aiSummary === null)) {
+    logger.warn(`all project summaries failed via ${provider}, skipping standup`);
+    return recap;
+  }
+
+  const standupResult = await generateStandup(recap, config, logger);
+  recap.standupMessage = standupResult;
 
   return recap;
 }
 
+// ── Summarize helpers ────────────────────────────────────────────
+
 async function summarizeProject(
   project: ProjectSummary,
   config: DevDayConfig,
+  logger: SummarizeLogger,
 ): Promise<string | null> {
   const prompt = buildProjectPrompt(project);
+  const result = await callLlm(config, prompt, logger);
 
-  if (config.preferredSummarizer === 'anthropic' && config.anthropicApiKey) {
-    return callAnthropic(config.anthropicApiKey, prompt);
+  if (!result.ok) {
+    logger.warn(`summary failed for "${project.projectName}": ${result.error}`);
+    return null;
   }
-  if (config.preferredSummarizer === 'openai' && config.openaiApiKey) {
-    return callOpenAI(config.openaiApiKey, prompt);
-  }
-  return null;
+  return result.text;
 }
 
 async function generateStandup(
   recap: DayRecap,
   config: DevDayConfig,
+  logger: SummarizeLogger,
 ): Promise<string | null> {
   const prompt = buildStandupPrompt(recap);
+  const result = await callLlm(config, prompt, logger);
 
+  if (!result.ok) {
+    logger.warn(`standup generation failed: ${result.error}`);
+    return null;
+  }
+  return result.text;
+}
+
+/**
+ * Route to the correct LLM backend based on config.
+ */
+async function callLlm(
+  config: DevDayConfig,
+  prompt: string,
+  logger: SummarizeLogger,
+): Promise<LlmResult> {
+  if (config.preferredSummarizer === 'concentrate' && config.concentrateApiKey) {
+    return callConcentrate(config.concentrateApiKey, prompt, logger);
+  }
   if (config.preferredSummarizer === 'anthropic' && config.anthropicApiKey) {
-    return callAnthropic(config.anthropicApiKey, prompt);
+    return callAnthropic(config.anthropicApiKey, prompt, logger);
   }
   if (config.preferredSummarizer === 'openai' && config.openaiApiKey) {
-    return callOpenAI(config.openaiApiKey, prompt);
+    return callOpenAI(config.openaiApiKey, prompt, logger);
   }
-  return null;
+  return { ok: false, error: 'no API key configured', retriable: false };
 }
 
 // ── Prompts ──────────────────────────────────────────────────────
@@ -117,12 +172,122 @@ ${projectBlocks}
 Write the standup as bullet points, starting each with "- ". First person, specific, concise.`;
 }
 
+// ── HTTP error helpers ───────────────────────────────────────────
+
+function describeHttpError(status: number, body: string, provider: string): LlmResult {
+  const truncatedBody = body.length > 200 ? body.slice(0, 200) + '...' : body;
+
+  switch (status) {
+    case 401:
+    case 403:
+      return { ok: false, error: `${provider}: invalid API key (${status})`, retriable: false };
+    case 429:
+      return { ok: false, error: `${provider}: rate limited (429) — try again shortly`, retriable: true };
+    case 402:
+      return { ok: false, error: `${provider}: insufficient credits (402)`, retriable: false };
+    case 400:
+      return { ok: false, error: `${provider}: bad request (400): ${truncatedBody}`, retriable: false };
+    default:
+      if (status >= 500) {
+        return { ok: false, error: `${provider}: server error (${status}): ${truncatedBody}`, retriable: true };
+      }
+      return { ok: false, error: `${provider}: HTTP ${status}: ${truncatedBody}`, retriable: false };
+  }
+}
+
+function describeException(err: unknown, provider: string): LlmResult {
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return { ok: false, error: `${provider}: request timed out after ${LLM_TIMEOUT_MS / 1000}s`, retriable: true };
+  }
+  if (err instanceof TypeError && (err.message.includes('fetch') || err.message.includes('network'))) {
+    return { ok: false, error: `${provider}: network error — ${err.message}`, retriable: true };
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return { ok: false, error: `${provider}: ${msg}`, retriable: false };
+}
+
 // ── LLM API calls ────────────────────────────────────────────────
 
-async function callAnthropic(apiKey: string, prompt: string): Promise<string | null> {
+async function callConcentrate(apiKey: string, prompt: string, logger: SummarizeLogger): Promise<LlmResult> {
+  const provider = 'concentrate';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    logger.debug(`${provider}: calling gpt-5-mini (reasoning: low)`);
+
+    const res = await fetch('https://api.concentrate.ai/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-5-mini',
+        max_output_tokens: 600,
+        reasoning: { effort: 'low' },
+        input: prompt,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return describeHttpError(res.status, body, provider);
+    }
+
+    const data: unknown = await res.json();
+    const status = (data as Record<string, unknown>)?.status;
+
+    // Check for API-level incomplete/failed status
+    if (status === 'failed') {
+      const error = (data as Record<string, unknown>)?.error as Record<string, unknown> | undefined;
+      const msg = typeof error?.message === 'string' ? error.message : 'unknown error';
+      return { ok: false, error: `${provider}: response failed — ${msg}`, retriable: true };
+    }
+    if (status === 'incomplete') {
+      const details = (data as Record<string, unknown>)?.incomplete_details as Record<string, unknown> | undefined;
+      const reason = typeof details?.reason === 'string' ? details.reason : 'unknown';
+      return { ok: false, error: `${provider}: response incomplete — ${reason}`, retriable: false };
+    }
+
+    const output = (data as Record<string, unknown>)?.output;
+    if (!Array.isArray(output) || output.length === 0) {
+      return { ok: false, error: `${provider}: empty output array in response`, retriable: false };
+    }
+
+    // Find the assistant message (reasoning models put a reasoning block first)
+    const msg = output.find(
+      (item: unknown) => (item as Record<string, unknown>)?.type === 'message',
+    ) as Record<string, unknown> | undefined;
+    if (!msg) {
+      return { ok: false, error: `${provider}: no message item in output (got types: ${output.map((i: unknown) => (i as Record<string, unknown>)?.type).join(', ')})`, retriable: false };
+    }
+
+    const content = msg.content;
+    if (!Array.isArray(content) || content.length === 0) {
+      return { ok: false, error: `${provider}: message has no content blocks`, retriable: false };
+    }
+
+    const first = content[0] as Record<string, unknown>;
+    if (typeof first?.text !== 'string') {
+      return { ok: false, error: `${provider}: first content block has no text (type: ${first?.type})`, retriable: false };
+    }
+
+    logger.debug(`${provider}: success`);
+    return { ok: true, text: first.text };
+  } catch (err) {
+    return describeException(err, provider);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function callAnthropic(apiKey: string, prompt: string, logger: SummarizeLogger): Promise<LlmResult> {
+  const provider = 'anthropic';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+  try {
+    logger.debug(`${provider}: calling claude-3-5-haiku`);
 
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -139,24 +304,37 @@ async function callAnthropic(apiKey: string, prompt: string): Promise<string | n
       signal: controller.signal,
     });
 
-    clearTimeout(timeout);
-
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return describeHttpError(res.status, body, provider);
+    }
 
     const data: unknown = await res.json();
     const content = (data as Record<string, unknown>)?.content;
-    if (!Array.isArray(content) || content.length === 0) return null;
+    if (!Array.isArray(content) || content.length === 0) {
+      return { ok: false, error: `${provider}: empty content array in response`, retriable: false };
+    }
+
     const first = content[0] as Record<string, unknown>;
-    return typeof first?.text === 'string' ? first.text : null;
-  } catch {
-    return null;
+    if (typeof first?.text !== 'string') {
+      return { ok: false, error: `${provider}: first content block has no text (type: ${first?.type})`, retriable: false };
+    }
+
+    logger.debug(`${provider}: success`);
+    return { ok: true, text: first.text };
+  } catch (err) {
+    return describeException(err, provider);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-async function callOpenAI(apiKey: string, prompt: string): Promise<string | null> {
+async function callOpenAI(apiKey: string, prompt: string, logger: SummarizeLogger): Promise<LlmResult> {
+  const provider = 'openai';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    logger.debug(`${provider}: calling gpt-4o-mini`);
 
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -172,17 +350,28 @@ async function callOpenAI(apiKey: string, prompt: string): Promise<string | null
       signal: controller.signal,
     });
 
-    clearTimeout(timeout);
-
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return describeHttpError(res.status, body, provider);
+    }
 
     const data: unknown = await res.json();
     const choices = (data as Record<string, unknown>)?.choices;
-    if (!Array.isArray(choices) || choices.length === 0) return null;
+    if (!Array.isArray(choices) || choices.length === 0) {
+      return { ok: false, error: `${provider}: empty choices array in response`, retriable: false };
+    }
+
     const first = choices[0] as Record<string, unknown>;
     const message = first?.message as Record<string, unknown> | undefined;
-    return typeof message?.content === 'string' ? message.content : null;
-  } catch {
-    return null;
+    if (typeof message?.content !== 'string') {
+      return { ok: false, error: `${provider}: message has no content string`, retriable: false };
+    }
+
+    logger.debug(`${provider}: success`);
+    return { ok: true, text: message.content };
+  } catch (err) {
+    return describeException(err, provider);
+  } finally {
+    clearTimeout(timeout);
   }
 }
