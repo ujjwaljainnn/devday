@@ -77,7 +77,7 @@ async function generateStandup(
   config: DevDayConfig,
   logger: SummarizeLogger,
 ): Promise<string | null> {
-  const prompt = buildStandupPrompt(recap);
+  const prompt = buildStandupPrompt(recap, config);
   const result = await callLlm(config, prompt, logger);
 
   if (!result.ok) {
@@ -95,14 +95,16 @@ async function callLlm(
   prompt: string,
   logger: SummarizeLogger,
 ): Promise<LlmResult> {
+  const linearMcpTool = getLinearMcpTool(config);
+
   if (config.preferredSummarizer === 'concentrate' && config.concentrateApiKey) {
-    return callConcentrate(config.concentrateApiKey, prompt, logger);
+    return callConcentrate(config.concentrateApiKey, prompt, linearMcpTool, logger);
   }
   if (config.preferredSummarizer === 'anthropic' && config.anthropicApiKey) {
     return callAnthropic(config.anthropicApiKey, prompt, logger);
   }
   if (config.preferredSummarizer === 'openai' && config.openaiApiKey) {
-    return callOpenAI(config.openaiApiKey, prompt, logger);
+    return callOpenAI(config.openaiApiKey, prompt, linearMcpTool, logger);
   }
   return { ok: false, error: 'no API key configured', retriable: false };
 }
@@ -142,7 +144,37 @@ ${gitLines}
 Write a concise summary (2-3 sentences) in first person. Be specific about what was built/fixed/changed. Do not mention AI tools, session counts, or refer to "the developer".`;
 }
 
-function buildStandupPrompt(recap: DayRecap): string {
+function providerSupportsMcp(provider: DevDayConfig['preferredSummarizer']): boolean {
+  return provider === 'concentrate' || provider === 'openai';
+}
+
+function hasLinearMcp(config: DevDayConfig): boolean {
+  return providerSupportsMcp(config.preferredSummarizer) && !!config.linearMcpServerUrl;
+}
+
+function getPreviousDate(date: string): string {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return date;
+  parsed.setUTCDate(parsed.getUTCDate() - 1);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function buildLinearMcpPromptBlock(recapDate: string): string {
+  const previousDate = getPreviousDate(recapDate);
+  return `
+You have access to a Linear MCP server tool labeled "linear". Before writing the final answer, query Linear and pull:
+- tickets created on ${recapDate}
+- tickets closed/completed on ${recapDate} (if empty, check ${previousDate})
+- tickets currently assigned to me
+- tickets currently in active/in-progress states
+
+Use the ticket data to enrich the standup with concrete ticket IDs/titles when possible. After the accomplishment bullets, add:
+- one bullet that starts with "Things I'm working on:"
+- one bullet that starts with "Things I'm planning to work on:"
+If Linear data is unavailable or empty, omit these two bullets.`;
+}
+
+function buildStandupPrompt(recap: DayRecap, config: DevDayConfig): string {
   const projectBlocks = recap.projects
     .map((p) => {
       let block = `## ${p.projectName}\n`;
@@ -164,10 +196,12 @@ function buildStandupPrompt(recap: DayRecap): string {
       return block;
     })
     .join('\n\n');
+  const linearMcpInstructions = hasLinearMcp(config) ? buildLinearMcpPromptBlock(recap.date) : '';
 
   return `Generate a standup message for what I accomplished today. Write in FIRST PERSON ("I built...", "I fixed...", "I worked on..."). Write 3-5 bullet points using past tense. Be specific about what was done. Group by project. Do not include cost, token, or session count information. Do not use markdown headers. Do not refer to "the developer" — this is my own standup.
 
 ${projectBlocks}
+${linearMcpInstructions}
 
 Write the standup as bullet points, starting each with "- ". First person, specific, concise.`;
 }
@@ -208,12 +242,86 @@ function describeException(err: unknown, provider: string): LlmResult {
 
 // ── LLM API calls ────────────────────────────────────────────────
 
-async function callConcentrate(apiKey: string, prompt: string, logger: SummarizeLogger): Promise<LlmResult> {
+function getLinearMcpTool(config: DevDayConfig): Record<string, unknown> | null {
+  if (!providerSupportsMcp(config.preferredSummarizer) || !config.linearMcpServerUrl) {
+    return null;
+  }
+
+  const tool: Record<string, unknown> = {
+    type: 'mcp',
+    server_label: 'linear',
+    server_url: config.linearMcpServerUrl,
+    require_approval: 'never',
+  };
+
+  if (config.linearMcpAuthToken) {
+    tool.headers = { Authorization: `Bearer ${config.linearMcpAuthToken}` };
+  }
+
+  return tool;
+}
+
+function extractResponseText(data: unknown, provider: string): LlmResult {
+  const response = data as Record<string, unknown>;
+
+  if (typeof response.output_text === 'string' && response.output_text.trim().length > 0) {
+    return { ok: true, text: response.output_text.trim() };
+  }
+
+  const output = response.output;
+  if (!Array.isArray(output) || output.length === 0) {
+    return { ok: false, error: `${provider}: empty output array in response`, retriable: false };
+  }
+
+  const texts: string[] = [];
+  for (const item of output) {
+    const row = item as Record<string, unknown>;
+    if (row.type !== 'message') continue;
+
+    const content = row.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      const part = block as Record<string, unknown>;
+      if (typeof part.text === 'string' && part.text.trim().length > 0) {
+        texts.push(part.text.trim());
+      }
+    }
+  }
+
+  if (texts.length === 0) {
+    const outputTypes = output
+      .map((item) => String((item as Record<string, unknown>)?.type ?? 'unknown'))
+      .join(', ');
+    return { ok: false, error: `${provider}: no text output found (got types: ${outputTypes})`, retriable: false };
+  }
+
+  return { ok: true, text: texts.join('\n\n') };
+}
+
+async function callConcentrate(
+  apiKey: string,
+  prompt: string,
+  linearMcpTool: Record<string, unknown> | null,
+  logger: SummarizeLogger,
+): Promise<LlmResult> {
   const provider = 'concentrate';
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
-    logger.debug(`${provider}: calling gpt-5-mini (reasoning: low)`);
+    logger.debug(
+      `${provider}: calling gpt-5-mini (reasoning: low${linearMcpTool ? ', linear MCP enabled' : ''})`,
+    );
+
+    const body: Record<string, unknown> = {
+      model: 'gpt-5-mini',
+      max_output_tokens: 600,
+      reasoning: { effort: 'low' },
+      input: prompt,
+    };
+    if (linearMcpTool) {
+      body.tools = [linearMcpTool];
+      body.tool_choice = 'auto';
+    }
 
     const res = await fetch('https://api.concentrate.ai/v1/responses', {
       method: 'POST',
@@ -221,12 +329,7 @@ async function callConcentrate(apiKey: string, prompt: string, logger: Summarize
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model: 'gpt-5-mini',
-        max_output_tokens: 600,
-        reasoning: { effort: 'low' },
-        input: prompt,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 
@@ -250,31 +353,11 @@ async function callConcentrate(apiKey: string, prompt: string, logger: Summarize
       return { ok: false, error: `${provider}: response incomplete — ${reason}`, retriable: false };
     }
 
-    const output = (data as Record<string, unknown>)?.output;
-    if (!Array.isArray(output) || output.length === 0) {
-      return { ok: false, error: `${provider}: empty output array in response`, retriable: false };
-    }
-
-    // Find the assistant message (reasoning models put a reasoning block first)
-    const msg = output.find(
-      (item: unknown) => (item as Record<string, unknown>)?.type === 'message',
-    ) as Record<string, unknown> | undefined;
-    if (!msg) {
-      return { ok: false, error: `${provider}: no message item in output (got types: ${output.map((i: unknown) => (i as Record<string, unknown>)?.type).join(', ')})`, retriable: false };
-    }
-
-    const content = msg.content;
-    if (!Array.isArray(content) || content.length === 0) {
-      return { ok: false, error: `${provider}: message has no content blocks`, retriable: false };
-    }
-
-    const first = content[0] as Record<string, unknown>;
-    if (typeof first?.text !== 'string') {
-      return { ok: false, error: `${provider}: first content block has no text (type: ${first?.type})`, retriable: false };
-    }
+    const textResult = extractResponseText(data, provider);
+    if (!textResult.ok) return textResult;
 
     logger.debug(`${provider}: success`);
-    return { ok: true, text: first.text };
+    return textResult;
   } catch (err) {
     return describeException(err, provider);
   } finally {
@@ -329,24 +412,35 @@ async function callAnthropic(apiKey: string, prompt: string, logger: SummarizeLo
   }
 }
 
-async function callOpenAI(apiKey: string, prompt: string, logger: SummarizeLogger): Promise<LlmResult> {
+async function callOpenAI(
+  apiKey: string,
+  prompt: string,
+  linearMcpTool: Record<string, unknown> | null,
+  logger: SummarizeLogger,
+): Promise<LlmResult> {
   const provider = 'openai';
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
   try {
-    logger.debug(`${provider}: calling gpt-4o-mini`);
+    logger.debug(`${provider}: calling gpt-4o-mini${linearMcpTool ? ' with linear MCP' : ''}`);
 
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const body: Record<string, unknown> = {
+      model: 'gpt-4o-mini',
+      max_output_tokens: 400,
+      input: prompt,
+    };
+    if (linearMcpTool) {
+      body.tools = [linearMcpTool];
+      body.tool_choice = 'auto';
+    }
+
+    const res = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        max_tokens: 400,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 
@@ -356,19 +450,11 @@ async function callOpenAI(apiKey: string, prompt: string, logger: SummarizeLogge
     }
 
     const data: unknown = await res.json();
-    const choices = (data as Record<string, unknown>)?.choices;
-    if (!Array.isArray(choices) || choices.length === 0) {
-      return { ok: false, error: `${provider}: empty choices array in response`, retriable: false };
-    }
-
-    const first = choices[0] as Record<string, unknown>;
-    const message = first?.message as Record<string, unknown> | undefined;
-    if (typeof message?.content !== 'string') {
-      return { ok: false, error: `${provider}: message has no content string`, retriable: false };
-    }
+    const textResult = extractResponseText(data, provider);
+    if (!textResult.ok) return textResult;
 
     logger.debug(`${provider}: success`);
-    return { ok: true, text: message.content };
+    return textResult;
   } catch (err) {
     return describeException(err, provider);
   } finally {

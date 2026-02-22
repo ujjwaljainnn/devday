@@ -1,26 +1,9 @@
-import { existsSync } from 'node:fs';
-import { basename } from 'node:path';
+import { existsSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import Database from 'better-sqlite3';
-import type { Parser, Session, TokenUsage } from '../types.js';
+import type { Parser, Session } from '../types.js';
 import { estimateCost, emptyTokenUsage, sumTokens } from '../cost.js';
-
-// ── Cursor model name → known model ID mapping ──────────────────
-
-const CURSOR_MODEL_MAP: Record<string, string> = {
-  'composer-1': 'gpt-4o',             // Cursor's default agent model
-  'cheetah': 'gpt-4o-mini',           // Cursor's fast model
-  'default': 'gpt-4o',
-  'gpt-5': 'gpt-4o',                  // closest proxy
-  'gpt-5-codex': 'gpt-4o',
-  'claude-4.5-sonnet-thinking': 'claude-3-5-sonnet-20241022',
-  'claude-4-sonnet-thinking': 'claude-3-5-sonnet-20241022',
-  'claude-4.5-opus-high-thinking': 'claude-3-opus-20240229',
-};
-
-function mapCursorModel(cursorModel: string): string {
-  return CURSOR_MODEL_MAP[cursorModel] ?? cursorModel;
-}
 
 // ── Raw shapes from Cursor storage ───────────────────────────────
 
@@ -43,6 +26,23 @@ interface CursorComposerData {
   fullConversationHeadersOnly?: Array<{ bubbleId: string; type: number; serverBubbleId?: string }>;
   // v3+: sometimes inline map (often empty — data in separate KV entries)
   conversationMap?: Record<string, CursorBubble>;
+  context?: {
+    fileSelections?: unknown[];
+    folderSelections?: unknown[];
+    selections?: unknown[];
+    terminalSelections?: unknown[];
+    mentions?: {
+      fileSelections?: Record<string, unknown>;
+      folderSelections?: Record<string, unknown>;
+      selections?: Record<string, unknown>;
+      terminalSelections?: Record<string, unknown>;
+    };
+  };
+  originalFileStates?: Record<string, unknown>;
+  codeBlockData?: Record<string, unknown>;
+  newlyCreatedFiles?: unknown[];
+  newlyCreatedFolders?: unknown[];
+  conversationState?: string;
 }
 
 interface CursorBubble {
@@ -68,6 +68,11 @@ interface CursorBubble {
     languageId?: string;
   }>;
   thinking?: { text?: string };
+}
+
+interface LoadedBubbles {
+  dayBubbles: CursorBubble[];
+  allBubbles: CursorBubble[];
 }
 
 // ── Parser ───────────────────────────────────────────────────────
@@ -130,11 +135,17 @@ export class CursorParser implements Parser {
         if (!overlapsDay) continue;
 
         // 3. Load bubbles for this session
-        const bubbles = this.loadBubbles(db, composer, dayStartMs, dayEndMs);
-        if (bubbles.length === 0) continue;
+        const loadedBubbles = this.loadBubbles(db, composer, dayStartMs, dayEndMs);
+        if (loadedBubbles.dayBubbles.length === 0) continue;
 
         // 4. Build session
-        const session = this.buildSession(composer, bubbles, dayStartMs, dayEndMs);
+        const session = this.buildSession(
+          composer,
+          loadedBubbles.dayBubbles,
+          loadedBubbles.allBubbles,
+          dayStartMs,
+          dayEndMs,
+        );
         if (session) sessions.push(session);
       }
     } finally {
@@ -151,17 +162,19 @@ export class CursorParser implements Parser {
     composer: CursorComposerData,
     dayStartMs: number,
     dayEndMs: number,
-  ): CursorBubble[] {
-    const bubbles: CursorBubble[] = [];
+  ): LoadedBubbles {
+    const dayBubbles: CursorBubble[] = [];
+    const allBubbles: CursorBubble[] = [];
 
     // Strategy 1: v1 inline conversation array
     if (composer.conversation && Array.isArray(composer.conversation)) {
       for (const bubble of composer.conversation) {
+        allBubbles.push(bubble);
         if (this.bubbleInDay(bubble, composer, dayStartMs, dayEndMs)) {
-          bubbles.push(bubble);
+          dayBubbles.push(bubble);
         }
       }
-      if (bubbles.length > 0) return bubbles;
+      if (dayBubbles.length > 0) return { dayBubbles, allBubbles };
     }
 
     // Strategy 2: v3+ — load from separate KV entries
@@ -203,13 +216,16 @@ export class CursorParser implements Parser {
       // Return in conversation order, filtered by day
       for (const header of headers) {
         const bubble = bubbleMap.get(header.bubbleId);
-        if (bubble && bubble.type && this.bubbleInDay(bubble, composer, dayStartMs, dayEndMs)) {
-          bubbles.push(bubble);
+        if (!bubble || !bubble.type) continue;
+
+        allBubbles.push(bubble);
+        if (this.bubbleInDay(bubble, composer, dayStartMs, dayEndMs)) {
+          dayBubbles.push(bubble);
         }
       }
     }
 
-    return bubbles;
+    return { dayBubbles, allBubbles };
   }
 
   /** Check if a bubble's timestamp falls within the target day */
@@ -244,6 +260,7 @@ export class CursorParser implements Parser {
   private buildSession(
     composer: CursorComposerData,
     bubbles: CursorBubble[],
+    allBubbles: CursorBubble[],
     dayStartMs: number,
     dayEndMs: number,
   ): Session | null {
@@ -278,8 +295,7 @@ export class CursorParser implements Parser {
     // ── Cost estimation ───────────────────────────────────────
     let totalCost = 0;
     if (totalTokens.total > 0 && models.size > 0) {
-      const mappedModel = mapCursorModel([...models][0]);
-      totalCost = estimateCost(mappedModel, totalTokens);
+      totalCost = estimateCost([...models][0], totalTokens);
     }
 
     // ── Duration ──────────────────────────────────────────────
@@ -310,14 +326,7 @@ export class CursorParser implements Parser {
     }
 
     // ── Project path ──────────────────────────────────────────
-    // Extract from first bubble's cwd, or from any bubble that has it
-    let projectPath: string | null = null;
-    for (const b of bubbles) {
-      if (b.cwd) {
-        projectPath = b.cwd;
-        break;
-      }
-    }
+    const projectPath = this.resolveProjectPath(composer, allBubbles);
 
     // ── Timestamps ────────────────────────────────────────────
     const allTimestamps = bubbles
@@ -377,8 +386,8 @@ export class CursorParser implements Parser {
     if (composer.name) topics.push(composer.name);
     if (composer.subtitle) topics.push(composer.subtitle);
 
-    // Map model names for display
-    const displayModels = [...models].map(mapCursorModel);
+    // Keep the exact model names reported by Cursor metadata.
+    const displayModels = [...models];
 
     return {
       id: composer.composerId,
@@ -401,5 +410,201 @@ export class CursorParser implements Parser {
       conversationDigest,
       toolCallSummaries: uniqueToolSummaries,
     };
+  }
+
+  private resolveProjectPath(composer: CursorComposerData, bubbles: CursorBubble[]): string | null {
+    const candidates = new Set<string>();
+
+    for (const b of bubbles) {
+      this.addPathCandidate(candidates, b.cwd);
+      if (!b.codeBlocks) continue;
+      for (const cb of b.codeBlocks) {
+        this.addPathCandidate(candidates, cb.uri?.fsPath);
+        this.addPathCandidate(candidates, cb.uri?.path);
+      }
+    }
+
+    this.addComposerPathCandidates(composer, candidates);
+
+    for (const candidate of candidates) {
+      const gitRoot = this.findGitRoot(candidate);
+      if (gitRoot) return gitRoot;
+    }
+
+    for (const candidate of candidates) {
+      const existingDir = this.toExistingDirectory(candidate);
+      if (existingDir) return existingDir;
+    }
+
+    return null;
+  }
+
+  private addComposerPathCandidates(composer: CursorComposerData, out: Set<string>): void {
+    const mentions = composer.context?.mentions;
+    if (mentions) {
+      this.addSelectionRecordPathCandidates(out, mentions.fileSelections);
+      this.addSelectionRecordPathCandidates(out, mentions.folderSelections);
+      this.addSelectionRecordPathCandidates(out, mentions.selections);
+      this.addSelectionRecordPathCandidates(out, mentions.terminalSelections);
+    }
+
+    this.addSelectionListPathCandidates(out, composer.context?.fileSelections);
+    this.addSelectionListPathCandidates(out, composer.context?.folderSelections);
+    this.addSelectionListPathCandidates(out, composer.context?.selections);
+    this.addSelectionListPathCandidates(out, composer.context?.terminalSelections);
+    this.addSelectionListPathCandidates(out, composer.newlyCreatedFiles);
+    this.addSelectionListPathCandidates(out, composer.newlyCreatedFolders);
+
+    if (composer.originalFileStates) {
+      for (const key of Object.keys(composer.originalFileStates)) {
+        this.addPathCandidate(out, key);
+      }
+    }
+    if (composer.codeBlockData) {
+      for (const key of Object.keys(composer.codeBlockData)) {
+        this.addPathCandidate(out, key);
+      }
+    }
+
+    this.addEncodedConversationPathCandidates(out, composer.conversationState);
+  }
+
+  private addEncodedConversationPathCandidates(out: Set<string>, encoded: string | undefined): void {
+    if (!encoded) return;
+    const normalized = encoded.trim().startsWith('~')
+      ? encoded.trim().slice(1)
+      : encoded.trim();
+
+    if (!/^[A-Za-z0-9+/=]+$/.test(normalized) || normalized.length < 16) return;
+
+    let decoded: string;
+    try {
+      decoded = Buffer.from(normalized, 'base64').toString('utf-8');
+    } catch {
+      return;
+    }
+
+    const fileUriMatches = decoded.match(/file:\/\/\/?[^\s"'`<>]+/g) ?? [];
+    for (const match of fileUriMatches) {
+      this.addPathCandidate(out, match);
+    }
+
+    const absPathMatches = decoded.match(/\/(?:Users|home|opt|var|tmp)(?:\/[A-Za-z0-9._\-()[\] ]+)+/g) ?? [];
+    for (const match of absPathMatches) {
+      this.addPathCandidate(out, match);
+    }
+  }
+
+  private addSelectionRecordPathCandidates(
+    out: Set<string>,
+    record: Record<string, unknown> | undefined,
+  ): void {
+    if (!record) return;
+    for (const key of Object.keys(record)) {
+      this.addPathCandidate(out, key);
+
+      // Cursor stores many mentions as serialized JSON with uri/path fields.
+      try {
+        const parsed = JSON.parse(key) as unknown;
+        this.addPathCandidateFromUnknown(out, parsed);
+      } catch {
+        // key wasn't JSON
+      }
+    }
+  }
+
+  private addSelectionListPathCandidates(out: Set<string>, items: unknown[] | undefined): void {
+    if (!items) return;
+    for (const item of items) {
+      this.addPathCandidateFromUnknown(out, item);
+    }
+  }
+
+  private addPathCandidateFromUnknown(out: Set<string>, value: unknown): void {
+    if (!value) return;
+
+    if (typeof value === 'string') {
+      this.addPathCandidate(out, value);
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) this.addPathCandidateFromUnknown(out, item);
+      return;
+    }
+
+    if (typeof value !== 'object') return;
+    const obj = value as Record<string, unknown>;
+
+    this.addPathCandidateFromUnknown(out, obj.uri);
+    this.addPathCandidateFromUnknown(out, obj.path);
+    this.addPathCandidateFromUnknown(out, obj.fsPath);
+    this.addPathCandidateFromUnknown(out, obj.cwd);
+    this.addPathCandidateFromUnknown(out, obj.filePath);
+    this.addPathCandidateFromUnknown(out, obj.folderPath);
+    this.addPathCandidateFromUnknown(out, obj.fileUri);
+    this.addPathCandidateFromUnknown(out, obj.folderUri);
+  }
+
+  private addPathCandidate(out: Set<string>, rawPath: string | undefined): void {
+    if (!rawPath) return;
+    const normalized = this.normalizePath(rawPath);
+    if (normalized) out.add(normalized);
+  }
+
+  private normalizePath(rawPath: string): string | null {
+    const trimmed = rawPath.trim();
+    if (!trimmed) return null;
+
+    if (trimmed.startsWith('file://')) {
+      try {
+        const url = new URL(trimmed);
+        let pathname = decodeURIComponent(url.pathname);
+        if (process.platform === 'win32' && pathname.startsWith('/')) {
+          pathname = pathname.slice(1);
+        }
+        return pathname || null;
+      } catch {
+        return null;
+      }
+    }
+
+    if (trimmed.startsWith('~')) {
+      const withoutTilde = trimmed.slice(1).replace(/^[/\\]+/, '');
+      return join(homedir(), withoutTilde);
+    }
+
+    if (trimmed.startsWith('/')) return trimmed;
+    if (/^[a-zA-Z]:[\\/]/.test(trimmed)) return trimmed;
+
+    return null;
+  }
+
+  private toExistingDirectory(candidate: string): string | null {
+    if (!existsSync(candidate)) return null;
+    try {
+      const stat = statSync(candidate);
+      if (stat.isDirectory()) return candidate;
+      if (stat.isFile()) return dirname(candidate);
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  private findGitRoot(candidate: string): string | null {
+    let current = this.toExistingDirectory(candidate);
+    if (!current) return null;
+
+    while (true) {
+      if (existsSync(join(current, '.git'))) {
+        return current;
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+
+    return null;
   }
 }

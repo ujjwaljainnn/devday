@@ -1,5 +1,5 @@
 // ── Tool identifiers ──────────────────────────────────────────────
-export type ToolName = 'opencode' | 'claude-code' | 'cursor';
+export type ToolName = 'opencode' | 'claude-code' | 'cursor' | 'codex';
 
 // ── Unified session representation ───────────────────────────────
 export interface Session {
@@ -112,11 +112,16 @@ export interface DevDayConfig {
   openaiApiKey: string | null;
   preferredSummarizer: 'concentrate' | 'anthropic' | 'openai' | 'none';
 
+  // Optional Linear MCP integration for standup enrichment
+  linearMcpServerUrl: string | null; // remote MCP endpoint URL
+  linearMcpAuthToken: string | null; // bearer token for MCP server auth (if required)
+
   // Tool-specific paths (auto-detected, user-overridable)
   paths: {
     opencodeStorage: string | null;   // ~/.local/share/opencode/storage
     claudeCodeHome: string | null;    // ~/.claude
     cursorStateDb: string | null;     // ~/Library/Application Support/Cursor/...
+    codexHome: string | null;         // ~/.codex
   };
 
   // Which tools to scan
