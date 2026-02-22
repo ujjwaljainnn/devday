@@ -13,6 +13,7 @@ function getDefaultPaths() {
   return {
     opencodeStorage: join(home, '.local', 'share', 'opencode', 'storage'),
     claudeCodeHome: join(home, '.claude'),
+    codexHome: process.env.CODEX_HOME ?? join(home, '.codex'),
     cursorStateDb: platform === 'darwin'
       ? join(home, 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb')
       : platform === 'win32'
@@ -28,6 +29,7 @@ function detectAvailableTools(): ToolName[] {
   if (existsSync(paths.opencodeStorage)) tools.push('opencode');
   if (existsSync(paths.claudeCodeHome)) tools.push('claude-code');
   if (existsSync(paths.cursorStateDb)) tools.push('cursor');
+  if (existsSync(paths.codexHome)) tools.push('codex');
 
   return tools;
 }
@@ -43,6 +45,8 @@ export function loadConfig(): DevDayConfig {
   const concentrateKey = process.env.CONCENTRATE_API_KEY ?? null;
   const anthropicKey = process.env.ANTHROPIC_API_KEY ?? null;
   const openaiKey = process.env.OPENAI_API_KEY ?? null;
+  const linearMcpServerUrl = process.env.LINEAR_MCP_SERVER_URL ?? null;
+  const linearMcpAuthToken = process.env.LINEAR_MCP_AUTH_TOKEN ?? process.env.LINEAR_API_KEY ?? null;
 
   // Use whichever API key is available: Concentrate, OpenAI, or Anthropic
   let preferredSummarizer: 'concentrate' | 'anthropic' | 'openai' | 'none' = 'none';
@@ -55,10 +59,13 @@ export function loadConfig(): DevDayConfig {
     anthropicApiKey: anthropicKey,
     openaiApiKey: openaiKey,
     preferredSummarizer,
+    linearMcpServerUrl,
+    linearMcpAuthToken,
     paths: {
       opencodeStorage: existsSync(paths.opencodeStorage) ? paths.opencodeStorage : null,
       claudeCodeHome: existsSync(paths.claudeCodeHome) ? paths.claudeCodeHome : null,
       cursorStateDb: existsSync(paths.cursorStateDb) ? paths.cursorStateDb : null,
+      codexHome: existsSync(paths.codexHome) ? paths.codexHome : null,
     },
     enabledTools: detectAvailableTools(),
     gitAuthorFilter: null,
