@@ -3,6 +3,10 @@ import ora from 'ora';
 import chalk from 'chalk';
 import { format, subDays } from 'date-fns';
 import { homedir } from 'node:os';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require('../package.json');
 import { loadConfig } from './config.js';
 import { OpenCodeParser } from './parsers/opencode.js';
 import { ClaudeCodeParser } from './parsers/claude-code.js';
@@ -36,7 +40,7 @@ const program = new Command();
 program
   .name('devday')
   .description('End-of-day recap for AI-assisted coding sessions')
-  .version('0.1.0')
+  .version(PKG_VERSION)
   .option('-d, --date <date>', 'date: YYYY-MM-DD, "today", or "yesterday" (default: today)')
   .option('-s, --standup', 'output a short standup-ready summary')
   .option('-j, --json', 'output raw JSON')
@@ -241,7 +245,7 @@ function printBanner(
   date: string,
 ): void {
   console.log('');
-  console.log(chalk.bold.cyan('  devday') + chalk.dim(' v0.1.0'));
+  console.log(chalk.bold.cyan('  devday') + chalk.dim(` v${PKG_VERSION}`));
   console.log('');
 
   // Tools detected

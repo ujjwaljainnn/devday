@@ -1,6 +1,6 @@
 {
   "name": "devday",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "End-of-day recap for AI-assisted coding sessions. Reads OpenCode, Claude Code, Cursor, and Codex conversations, cross-references with git, and generates standup-ready summaries.",
   "type": "module",
   "bin": {
