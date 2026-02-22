@@ -42,6 +42,7 @@ interface CursorComposerData {
   codeBlockData?: Record<string, unknown>;
   newlyCreatedFiles?: unknown[];
   newlyCreatedFolders?: unknown[];
+  conversationState?: string;
 }
 
 interface CursorBubble {
@@ -463,6 +464,34 @@ export class CursorParser implements Parser {
       for (const key of Object.keys(composer.codeBlockData)) {
         this.addPathCandidate(out, key);
       }
+    }
+
+    this.addEncodedConversationPathCandidates(out, composer.conversationState);
+  }
+
+  private addEncodedConversationPathCandidates(out: Set<string>, encoded: string | undefined): void {
+    if (!encoded) return;
+    const normalized = encoded.trim().startsWith('~')
+      ? encoded.trim().slice(1)
+      : encoded.trim();
+
+    if (!/^[A-Za-z0-9+/=]+$/.test(normalized) || normalized.length < 16) return;
+
+    let decoded: string;
+    try {
+      decoded = Buffer.from(normalized, 'base64').toString('utf-8');
+    } catch {
+      return;
+    }
+
+    const fileUriMatches = decoded.match(/file:\/\/\/?[^\s"'`<>]+/g) ?? [];
+    for (const match of fileUriMatches) {
+      this.addPathCandidate(out, match);
+    }
+
+    const absPathMatches = decoded.match(/\/(?:Users|home|opt|var|tmp)(?:\/[A-Za-z0-9._\-()[\] ]+)+/g) ?? [];
+    for (const match of absPathMatches) {
+      this.addPathCandidate(out, match);
     }
   }
 
