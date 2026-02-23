@@ -1,7 +1,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import Database from 'better-sqlite3';
+import { ReadonlyDatabase } from '../db.js';
 import type { Parser, Session } from '../types.js';
 import { estimateCost, emptyTokenUsage, sumTokens } from '../cost.js';
 
@@ -97,9 +97,9 @@ export class CursorParser implements Parser {
     const dayStartMs = dayStart.getTime();
     const dayEndMs = dayEnd.getTime();
 
-    let db: InstanceType<typeof Database>;
+    let db: ReadonlyDatabase;
     try {
-      db = new Database(this.dbPath, { readonly: true });
+      db = await ReadonlyDatabase.open(this.dbPath);
     } catch {
       return [];
     }
@@ -108,14 +108,14 @@ export class CursorParser implements Parser {
 
     try {
       // 1. Load all composerData entries
-      const rows = db.prepare(
+      const rows = db.all<{ key: string; value: string | Uint8Array }>(
         "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'",
-      ).all() as Array<{ key: string; value: string | Buffer }>;
+      );
 
       for (const row of rows) {
         let composer: CursorComposerData;
         try {
-          const val = typeof row.value === 'string' ? row.value : row.value.toString('utf-8');
+          const val = typeof row.value === 'string' ? row.value : new TextDecoder().decode(row.value as Uint8Array);
           composer = JSON.parse(val) as CursorComposerData;
         } catch {
           continue;
@@ -158,7 +158,7 @@ export class CursorParser implements Parser {
   // ── Load bubbles ────────────────────────────────────────────────
 
   private loadBubbles(
-    db: InstanceType<typeof Database>,
+    db: ReadonlyDatabase,
     composer: CursorComposerData,
     dayStartMs: number,
     dayEndMs: number,
@@ -182,14 +182,15 @@ export class CursorParser implements Parser {
     if (headers && headers.length > 0) {
       // Batch query: get all bubbles for this composer at once
       const composerId = composer.composerId;
-      const rows = db.prepare(
+      const rows = db.all<{ key: string; value: string | Uint8Array }>(
         "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
-      ).all(`bubbleId:${composerId}:%`) as Array<{ key: string; value: string | Buffer }>;
+        `bubbleId:${composerId}:%`,
+      );
 
       const bubbleMap = new Map<string, CursorBubble>();
       for (const row of rows) {
         try {
-          const val = typeof row.value === 'string' ? row.value : row.value.toString('utf-8');
+          const val = typeof row.value === 'string' ? row.value : new TextDecoder().decode(row.value as Uint8Array);
           const bubble = JSON.parse(val) as CursorBubble;
           // Extract bubbleId from key: "bubbleId:{composerId}:{bubbleId}"
           const parts = (row.key as string).split(':');

@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
-import Database from 'better-sqlite3';
+import { ReadonlyDatabase } from '../db.js';
 import type { Parser, Session, TokenUsage } from '../types.js';
 import { estimateCost, emptyTokenUsage, sumTokens } from '../cost.js';
 
@@ -117,10 +117,10 @@ export class ClaudeCodeParser implements Parser {
 
     // Open SQLite for cost/duration data (optional — parser works without it)
     const dbPath = join(this.claudeHome, '__store.db');
-    let db: InstanceType<typeof Database> | null = null;
+    let db: ReadonlyDatabase | null = null;
     if (existsSync(dbPath)) {
       try {
-        db = new Database(dbPath, { readonly: true });
+        db = await ReadonlyDatabase.open(dbPath);
       } catch {
         // Can't open DB — continue without it
       }
@@ -190,7 +190,7 @@ export class ClaudeCodeParser implements Parser {
     projectName: string,
     dayStartMs: number,
     dayEndMs: number,
-    db: InstanceType<typeof Database> | null,
+    db: ReadonlyDatabase | null,
   ): Session | null {
     // Try DB-based approach first (more structured)
     if (db) {
@@ -210,25 +210,25 @@ export class ClaudeCodeParser implements Parser {
     projectName: string,
     dayStartMs: number,
     dayEndMs: number,
-    db: InstanceType<typeof Database>,
+    db: ReadonlyDatabase,
   ): Session | null {
     try {
       // Get assistant messages for this session within the target day
-      const assistantRows = db.prepare(`
+      const assistantRows = db.all<AssistantRow>(`
         SELECT b.uuid, b.session_id, b.timestamp, a.cost_usd, a.duration_ms, a.model, a.message
         FROM base_messages b
         JOIN assistant_messages a ON a.uuid = b.uuid
         WHERE b.session_id = ? AND b.timestamp >= ? AND b.timestamp <= ?
         ORDER BY b.timestamp
-      `).all(entry.sessionId, dayStartMs, dayEndMs) as AssistantRow[];
+      `, entry.sessionId, dayStartMs, dayEndMs);
 
-      const userRows = db.prepare(`
+      const userRows = db.all<UserRow>(`
         SELECT b.uuid, b.session_id, b.timestamp, u.message
         FROM base_messages b
         JOIN user_messages u ON u.uuid = b.uuid
         WHERE b.session_id = ? AND b.timestamp >= ? AND b.timestamp <= ?
         ORDER BY b.timestamp
-      `).all(entry.sessionId, dayStartMs, dayEndMs) as UserRow[];
+      `, entry.sessionId, dayStartMs, dayEndMs);
 
       const totalMessages = assistantRows.length + userRows.length;
       if (totalMessages === 0) return null;
