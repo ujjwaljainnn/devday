@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { ReadonlyDatabase } from '../db.js';
@@ -135,48 +135,116 @@ export class ClaudeCodeParser implements Parser {
       for (const projDir of projectDirs) {
         const projPath = join(projectsDir, projDir.name);
         const indexPath = join(projPath, 'sessions-index.json');
-        if (!existsSync(indexPath)) continue;
 
-        let index: CCSessionsIndex;
+        let index: CCSessionsIndex | null = null;
         try {
-          index = JSON.parse(readFileSync(indexPath, 'utf-8')) as CCSessionsIndex;
+          if (existsSync(indexPath)) {
+            index = JSON.parse(readFileSync(indexPath, 'utf-8')) as CCSessionsIndex;
+          }
         } catch {
-          continue;
+          // ignore parse errors
         }
 
         // Get the real project path from the first session entry
         // (directory name encoding is lossy — dashes in dir names become ambiguous)
-        const projectPath = index.entries[0]?.projectPath ?? projDir.name.replace(/^-/, '/').replace(/-/g, '/');
+        const projectPath = index?.entries[0]?.projectPath ?? projDir.name.replace(/^-/, '/').replace(/-/g, '/');
         const projectName = basename(projectPath);
 
-        for (const entry of index.entries) {
-          if (entry.isSidechain) continue;
+        const indexedSessionIds = new Set<string>();
 
-          // Filter by date: session must overlap with the target day
-          const createdMs = new Date(entry.created).getTime();
-          const modifiedMs = new Date(entry.modified).getTime();
+        if (index) {
+          for (const entry of index.entries) {
+            indexedSessionIds.add(entry.sessionId);
+            if (entry.isSidechain) continue;
 
-          const overlapsDay =
-            (createdMs >= dayStartMs && createdMs <= dayEndMs) ||
-            (modifiedMs >= dayStartMs && modifiedMs <= dayEndMs) ||
-            (createdMs <= dayStartMs && modifiedMs >= dayEndMs);
+            // Filter by date: session must overlap with the target day
+            const createdMs = new Date(entry.created).getTime();
+            const modifiedMs = new Date(entry.modified).getTime();
 
-          if (!overlapsDay) continue;
+            const overlapsDay =
+              (createdMs >= dayStartMs && createdMs <= dayEndMs) ||
+              (modifiedMs >= dayStartMs && modifiedMs <= dayEndMs) ||
+              (createdMs <= dayStartMs && modifiedMs >= dayEndMs);
 
-          // Build session from JSONL + optional DB data
-          const session = this.buildSession(
-            entry,
-            projectPath,
-            projectName,
-            dayStartMs,
-            dayEndMs,
-            db,
-          );
-          if (session) sessions.push(session);
+            if (!overlapsDay) continue;
+
+            // Build session from JSONL + optional DB data
+            const session = this.buildSession(
+              entry,
+              projectPath,
+              projectName,
+              dayStartMs,
+              dayEndMs,
+              db,
+            );
+            if (session) sessions.push(session);
+          }
         }
+
+        // Scan for unindexed JSONL files (sessions-index.json can be stale)
+        const unindexedSessions = this.discoverUnindexedSessions(
+          projPath, indexedSessionIds, projectPath, projectName,
+          dayStartMs, dayEndMs, db,
+        );
+        sessions.push(...unindexedSessions);
       }
     } finally {
       db?.close();
+    }
+
+    return sessions;
+  }
+
+  // ── Discover unindexed sessions ─────────────────────────────────
+
+  private discoverUnindexedSessions(
+    projPath: string,
+    indexedSessionIds: Set<string>,
+    projectPath: string,
+    projectName: string,
+    dayStartMs: number,
+    dayEndMs: number,
+    db: ReadonlyDatabase | null,
+  ): Session[] {
+    const sessions: Session[] = [];
+
+    let files: string[];
+    try {
+      files = readdirSync(projPath).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      return sessions;
+    }
+
+    for (const file of files) {
+      const sessionId = file.replace('.jsonl', '');
+      if (indexedSessionIds.has(sessionId)) continue;
+
+      const fullPath = join(projPath, file);
+
+      // Quick check: file mtime must be on or after the target day
+      try {
+        const stat = statSync(fullPath);
+        if (stat.mtimeMs < dayStartMs) continue;
+      } catch {
+        continue;
+      }
+
+      // Build a synthetic entry and try to build a session from JSONL
+      const entry: CCSessionEntry = {
+        sessionId,
+        fullPath,
+        fileMtime: 0,
+        firstPrompt: '',
+        messageCount: 0,
+        created: new Date(dayStartMs).toISOString(),
+        modified: new Date(dayEndMs).toISOString(),
+        projectPath,
+      };
+
+      const session = this.buildSessionFromJsonl(
+        entry, projectPath, projectName, dayStartMs, dayEndMs,
+      );
+      if (session) sessions.push(session);
     }
 
     return sessions;
